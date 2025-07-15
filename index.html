@@ -157,8 +157,8 @@
         relaxModel: 'relaxfox.glb', 
         spawnTime: 40000, // 40 seconds
         spawnPosition: { x: 3, z: -1 },
-        firePosition: { x: 1.2, z: -1 },
-        walkSpeed: 0.5
+        firePosition: { x: 0.5, z: -0.8 }, // Much closer to fire
+        walkSpeed: 0.17 // 3x slower
       }
       // Future friends can be added here:
       // { id: 'rabbit', walkingModel: 'walkinrabbit.glb', relaxModel: 'relaxrabbit.glb', spawnTime: 80000, ... }
@@ -168,6 +168,7 @@
     let lastFireState = true; // true = burning, false = out
     let friendModels = {}; // Cache for loaded models
     let gltfLoader = null;
+    let friendWalkingAudio = {}; // Track friend walking audio
     
     // Settings
     const MOVEMENT_SPEED = 0.8;
@@ -264,38 +265,58 @@
     function createFallbackFriend() {
       const friendGroup = new THREE.Group();
       
-      // Body
-      const bodyGeometry = new THREE.CylinderGeometry(0.06, 0.08, 0.15, 8);
+      // Body (more box-like)
+      const bodyGeometry = new THREE.BoxGeometry(0.2, 0.12, 0.35);
       const bodyMaterial = new THREE.MeshStandardMaterial({ 
         color: 0xd2691e, 
         roughness: 0.8 
       });
       const body = new THREE.Mesh(bodyGeometry, bodyMaterial);
-      body.position.y = 0.075;
+      body.position.y = 0.06;
       body.castShadow = true;
       friendGroup.add(body);
       
-      // Head
-      const headGeometry = new THREE.SphereGeometry(0.05, 12, 12);
+      // Head (box-like)
+      const headGeometry = new THREE.BoxGeometry(0.15, 0.12, 0.15);
       const headMaterial = new THREE.MeshStandardMaterial({ 
         color: 0xd2691e, 
         roughness: 0.8 
       });
       const head = new THREE.Mesh(headGeometry, headMaterial);
-      head.position.y = 0.18;
+      head.position.set(0, 0.15, 0.15);
       head.castShadow = true;
       friendGroup.add(head);
       
-      // Ears
+      // Ears (triangular boxes)
       for (let i = 0; i < 2; i++) {
-        const earGeometry = new THREE.ConeGeometry(0.02, 0.05, 6);
+        const earGeometry = new THREE.BoxGeometry(0.04, 0.08, 0.02);
         const ear = new THREE.Mesh(earGeometry, headMaterial);
-        ear.position.set(i === 0 ? -0.03 : 0.03, 0.22, 0.02);
+        ear.position.set(i === 0 ? -0.06 : 0.06, 0.22, 0.18);
+        ear.rotation.z = (i === 0 ? -0.3 : 0.3);
         ear.castShadow = true;
         friendGroup.add(ear);
       }
       
-      friendGroup.scale.setScalar(0.8);
+      // Legs (four box legs)
+      for (let i = 0; i < 4; i++) {
+        const legGeometry = new THREE.BoxGeometry(0.04, 0.08, 0.04);
+        const leg = new THREE.Mesh(legGeometry, bodyMaterial);
+        const x = i < 2 ? -0.07 : 0.07;
+        const z = i % 2 === 0 ? 0.12 : -0.05;
+        leg.position.set(x, -0.02, z);
+        leg.castShadow = true;
+        friendGroup.add(leg);
+      }
+      
+      // Tail (box)
+      const tailGeometry = new THREE.BoxGeometry(0.03, 0.03, 0.12);
+      const tail = new THREE.Mesh(tailGeometry, bodyMaterial);
+      tail.position.set(0, 0.08, -0.2);
+      tail.rotation.x = 0.5;
+      tail.castShadow = true;
+      friendGroup.add(tail);
+      
+      friendGroup.scale.setScalar(1.2); // Bigger than before
       friendGroup.position.y = -0.8;
       
       return friendGroup;
@@ -351,6 +372,8 @@
       friends.forEach(friend => {
         if (!friend.object) return;
         
+        const wasMoving = friend.isMoving;
+        
         switch (friend.state) {
           case 'walking_to_fire':
             updateFriendMovement(friend, friend.targetPosition, () => {
@@ -376,6 +399,15 @@
               console.log(`Friend ${friend.config.id} has left the scene`);
             });
             break;
+        }
+        
+        // Handle walking audio
+        if (friend.isMoving && !wasMoving) {
+          // Started moving
+          startFriendWalkingAudio(friend.config.id);
+        } else if (!friend.isMoving && wasMoving) {
+          // Stopped moving
+          stopFriendWalkingAudio(friend.config.id);
         }
       });
     }
@@ -468,6 +500,9 @@
     }
     
     function removeFriend(friend) {
+      // Stop any walking audio for this friend
+      stopFriendWalkingAudio(friend.config.id);
+      
       if (friend.object) {
         scene.remove(friend.object);
         if (friend.object.geometry) friend.object.geometry.dispose();
@@ -501,6 +536,9 @@
     }
     
     function clearAllFriends() {
+      // Stop all friend walking audio
+      stopAllFriendAudio();
+      
       friends.forEach(friend => {
         if (friend.object || friend.relaxModel) {
           removeFriend(friend);
@@ -685,7 +723,54 @@
       Object.keys(audioSources).forEach(name => {
         stopAudioSource(name);
       });
+      stopAllFriendAudio();
       isCharacterWalking = false;
+    }
+    
+    // Friend audio functions
+    function startFriendWalkingAudio(friendId) {
+      if (!isAudioLoaded || !audioBuffers.walking || friendWalkingAudio[friendId]) return;
+      
+      try {
+        const source = audioContext.createBufferSource();
+        const gainNode = audioContext.createGain();
+        
+        source.buffer = audioBuffers.walking;
+        source.loop = true;
+        source.connect(gainNode);
+        gainNode.connect(audioContext.destination);
+        
+        // Quieter than main character (0.15 vs 0.4)
+        gainNode.gain.setValueAtTime(0.15, audioContext.currentTime);
+        
+        source.start(0);
+        friendWalkingAudio[friendId] = { source, gainNode };
+        
+        source.onended = () => {
+          if (friendWalkingAudio[friendId] && friendWalkingAudio[friendId].source === source) {
+            delete friendWalkingAudio[friendId];
+          }
+        };
+      } catch (error) {
+        console.warn(`Failed to start friend walking audio for ${friendId}:`, error);
+      }
+    }
+    
+    function stopFriendWalkingAudio(friendId) {
+      if (!friendWalkingAudio[friendId]) return;
+      
+      try {
+        friendWalkingAudio[friendId].source.stop();
+        delete friendWalkingAudio[friendId];
+      } catch (error) {
+        console.warn(`Failed to stop friend walking audio for ${friendId}:`, error);
+      }
+    }
+    
+    function stopAllFriendAudio() {
+      Object.keys(friendWalkingAudio).forEach(friendId => {
+        stopFriendWalkingAudio(friendId);
+      });
     }
 
     function init() {
